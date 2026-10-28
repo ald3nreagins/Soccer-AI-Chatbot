@@ -8,8 +8,22 @@ const { SYSTEM_PROMPT } = require("./prompt");
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+
+// LLM Provider Configuration: supports local Ollama OR Cloud API (Groq, OpenRouter, OpenAI)
+const LLM_API_KEY =
+  process.env.GROQ_API_KEY ||
+  process.env.LLM_API_KEY ||
+  process.env.OPENAI_API_KEY ||
+  null;
+
+const LLM_BASE_URL =
+  process.env.LLM_BASE_URL ||
+  (process.env.GROQ_API_KEY ? "https://api.groq.com/openai/v1" : null);
+
+const IS_CLOUD_LLM = Boolean(LLM_API_KEY);
 const OLLAMA_URL = process.env.OLLAMA_URL || "http://localhost:11434";
-const DEFAULT_MODEL = process.env.MODEL || "qwen3:8b";
+const DEFAULT_MODEL =
+  process.env.MODEL || (IS_CLOUD_LLM ? "llama-3.1-8b-instant" : "qwen3:8b");
 
 app.use(cors());
 app.use(express.json());
@@ -301,29 +315,52 @@ class ThinkFilter {
 /* ────────────────────────────────────────── */
 
 app.get("/api/health", async (req, res) => {
-  let ollamaConnected = false;
+  let llmConnected = false;
   let availableModels = [];
 
-  try {
-    const r = await fetch(`${OLLAMA_URL}/api/tags`, { signal: AbortSignal.timeout(2000) });
-    if (r.ok) {
-      const data = await r.json();
-      ollamaConnected = true;
-      availableModels = (data.models || []).map((m) => m.name);
+  if (IS_CLOUD_LLM) {
+    try {
+      const endpoint = `${LLM_BASE_URL.replace(/\/+$/, "")}/models`;
+      const r = await fetch(endpoint, {
+        headers: { Authorization: `Bearer ${LLM_API_KEY}` },
+        signal: AbortSignal.timeout(3000),
+      });
+      if (r.ok) {
+        const data = await r.json();
+        llmConnected = true;
+        availableModels = (data.data || []).map((m) => m.id).slice(0, 10);
+      }
+    } catch {
+      // cloud fetch timeout
     }
-  } catch {
-    // Ollama not responding
+  } else {
+    try {
+      const r = await fetch(`${OLLAMA_URL}/api/tags`, { signal: AbortSignal.timeout(2000) });
+      if (r.ok) {
+        const data = await r.json();
+        llmConnected = true;
+        availableModels = (data.models || []).map((m) => m.name);
+      }
+    } catch {
+      // Ollama not responding
+    }
   }
 
   res.json({
     status: "ok",
     server: "soccer-ai-chatbot-server",
     port: PORT,
+    mode: IS_CLOUD_LLM ? "cloud" : "local_ollama",
+    llmProvider: IS_CLOUD_LLM
+      ? process.env.GROQ_API_KEY
+        ? "Groq"
+        : "OpenAI-compatible"
+      : "Ollama",
     statsLoaded: stats.rowCount(),
+    teamsLoaded: stats.teamCount(),
     seasons: stats.seasons(),
     configuredModel: DEFAULT_MODEL,
-    ollamaUrl: OLLAMA_URL,
-    ollamaConnected,
+    llmConnected,
     availableModels,
   });
 });
@@ -398,26 +435,44 @@ app.post("/api/chat", async (req, res) => {
 
       let response;
       try {
-        response = await fetch(`${OLLAMA_URL}/api/chat`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            model: activeModel,
-            messages: conversation,
-            tools: TOOLS,
-            think: activeThink,
-            stream: true,
-          }),
-        });
+        if (IS_CLOUD_LLM) {
+          const endpoint = `${LLM_BASE_URL.replace(/\/+$/, "")}/chat/completions`;
+          response = await fetch(endpoint, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${LLM_API_KEY}`,
+            },
+            body: JSON.stringify({
+              model: activeModel,
+              messages: conversation,
+              tools: TOOLS,
+              stream: true,
+            }),
+          });
+        } else {
+          response = await fetch(`${OLLAMA_URL}/api/chat`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              model: activeModel,
+              messages: conversation,
+              tools: TOOLS,
+              think: activeThink,
+              stream: true,
+            }),
+          });
+        }
       } catch (networkErr) {
+        const target = IS_CLOUD_LLM ? LLM_BASE_URL : OLLAMA_URL;
         throw new Error(
-          `Cannot reach Ollama at ${OLLAMA_URL}. Is Ollama running? (Command: 'ollama run ${activeModel}'). Error: ${networkErr.message}`
+          `Cannot reach LLM provider at ${target}. Error: ${networkErr.message}`
         );
       }
 
       if (!response.ok) {
         const errText = await response.text();
-        throw new Error(`Ollama HTTP ${response.status}: ${errText}`);
+        throw new Error(`LLM provider HTTP ${response.status}: ${errText}`);
       }
 
       const reader = response.body.getReader();
@@ -439,24 +494,61 @@ app.post("/api/chat", async (req, res) => {
         for (const line of lines) {
           const trimmed = line.trim();
           if (!trimmed) continue;
+          if (trimmed === "data: [DONE]") break;
+
           try {
-            const chunk = JSON.parse(trimmed);
-            const msg = chunk.message || {};
+            const jsonStr = trimmed.startsWith("data: ") ? trimmed.slice(6) : trimmed;
+            const chunk = JSON.parse(jsonStr);
 
-            if (Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) {
-              for (const tc of msg.tool_calls) {
-                turnToolCalls.push(tc);
+            // 1. OpenAI / Groq format: chunk.choices[0].delta
+            if (chunk.choices && Array.isArray(chunk.choices)) {
+              const delta = chunk.choices[0]?.delta || {};
+
+              if (Array.isArray(delta.tool_calls)) {
+                for (const tc of delta.tool_calls) {
+                  const idx = tc.index ?? turnToolCalls.length;
+                  if (!turnToolCalls[idx]) {
+                    turnToolCalls[idx] = {
+                      id: tc.id || `call_${idx}`,
+                      type: "function",
+                      function: { name: tc.function?.name || "", arguments: "" },
+                    };
+                  }
+                  if (tc.id) {
+                    turnToolCalls[idx].id = tc.id;
+                  }
+                  if (tc.function?.name) {
+                    turnToolCalls[idx].function.name = tc.function.name;
+                  }
+                  if (tc.function?.arguments) {
+                    turnToolCalls[idx].function.arguments += tc.function.arguments;
+                  }
+                }
               }
-            }
 
-            if (typeof msg.content === "string" && msg.content) {
-              const clean = thinkFilter.filter(msg.content);
-              if (clean) {
-                turnContent += clean;
-                sendEvent({
-                  type: "text",
-                  text: clean,
-                });
+              if (typeof delta.content === "string" && delta.content) {
+                const clean = thinkFilter.filter(delta.content);
+                if (clean) {
+                  turnContent += clean;
+                  sendEvent({ type: "text", text: clean });
+                }
+              }
+            } else {
+              // 2. Ollama format: chunk.message
+              const msg = chunk.message || {};
+
+              if (Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) {
+                for (const tc of msg.tool_calls) {
+                  turnToolCalls.push(tc);
+                }
+              }
+
+              if (typeof msg.content === "string" && msg.content) {
+                const clean = thinkFilter.filter(msg.content);
+                if (clean) {
+                  turnContent += clean;
+                  sendEvent({ type: "text", text: clean });
+                }
               }
             }
           } catch {
@@ -478,8 +570,18 @@ app.post("/api/chat", async (req, res) => {
       if (turnToolCalls.length > 0) {
         conversation.push({
           role: "assistant",
-          content: turnContent,
-          tool_calls: turnToolCalls,
+          content: turnContent || null,
+          tool_calls: turnToolCalls.map((tc, idx) => ({
+            id: tc.id || `call_${idx}`,
+            type: "function",
+            function: {
+              name: tc.function?.name,
+              arguments:
+                typeof tc.function?.arguments === "string"
+                  ? tc.function.arguments
+                  : JSON.stringify(tc.function?.arguments || {}),
+            },
+          })),
         });
 
         for (const tc of turnToolCalls) {
@@ -514,6 +616,8 @@ app.post("/api/chat", async (req, res) => {
           // Append tool execution response to conversation
           conversation.push({
             role: "tool",
+            tool_call_id: tc.id || `call_${fnName}`,
+            name: fnName,
             content: JSON.stringify(toolResult),
           });
         }
@@ -570,8 +674,9 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`\n======================================================`);
   console.log(`  Soccer AI Match Analyst — Express Backend`);
   console.log(`  Listening on: http://localhost:${PORT} (0.0.0.0:${PORT})`);
-  console.log(`  Ollama Target: ${OLLAMA_URL} (Model: ${DEFAULT_MODEL})`);
-  console.log(`  Dataset: ${stats.rowCount()} player rows loaded`);
+  console.log(`  Mode: ${IS_CLOUD_LLM ? `Cloud (${process.env.GROQ_API_KEY ? "Groq" : "OpenAI-compatible"})` : "Local Ollama"}`);
+  console.log(`  Model: ${DEFAULT_MODEL}`);
+  console.log(`  Dataset: ${stats.rowCount()} player rows, ${stats.teamCount()} teams loaded`);
   console.log(`======================================================\n`);
 });
 

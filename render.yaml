@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: soccer-ai-backend
+    runtime: node
+    rootDir: server
+    buildCommand: npm install
+    startCommand: npm start
+    plan: free
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: GROQ_API_KEY
+        sync: false
+      - key: MODEL
+        value: llama-3.1-8b-instant
+      - key: MIN_MINUTES
+        value: "360"
+
