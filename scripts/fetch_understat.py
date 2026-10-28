@@ -51,7 +51,7 @@ def main():
         print(f"OK {league}: {len(df)} rows")
 
     OUT.parent.mkdir(parents=True, exist_ok=True)
-    OUT.write_text(json.dumps(rows, ensure_ascii=False))
+    OUT.write_text(json.dumps(rows, ensure_ascii=False), encoding="utf-8")
     print(f"\nSaved {len(rows)} rows to {OUT}")
     if rows:
         print("Columns:", sorted(rows[0].keys()))
