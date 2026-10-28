@@ -1,17 +1,3 @@
-"""
-data_connector.py — Data-to-AI Integration Pipeline for Soccer AI Chatbot
-Course: ENGCMP 0600 Project #4 (AI Chatbot Implementation)
-Authors: Quentin Sharr (Data-to-AI Integration), Matthew Sneyers (Data), Alden Reagins (AI), Ruadhan KellerMcleer (Web/UX)
-
-Description:
-Connects our raw football data sources:
-1. `soccerdata` (FBref advanced expected metrics: xG, npxG, xA, KP, SoT%, G-xG)
-2. `API-Football v3` (REST API for live fixtures, standings, and basic player stats)
-3. `soccer_stat_glossary.md` (Canonical definitions and per-90 benchmarks)
-
-Outputs a clean, machine-readable JSON/Markdown context bundle inside `SystemMemory/`
-that can be uploaded directly to a Google Gemini Gem or injected into an LLM API call.
-"""
 
 import os
 import json
