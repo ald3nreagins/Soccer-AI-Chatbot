@@ -1,21 +1,21 @@
 export async function POST(request: Request) {
   try {
-    const { messages } = await request.json();
+    const { messages, model } = await request.json();
 
-    const backendUrl = process.env.BACKEND_API_URL || "http://localhost:3001";
+    const backendUrl = process.env.BACKEND_API_URL || "http://127.0.0.1:3001";
 
     let backendResponse: Response;
     try {
       backendResponse = await fetch(`${backendUrl}/api/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messages }),
+        body: JSON.stringify({ messages, model }),
       });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       return Response.json(
         {
-          error: `Unable to connect to backend server: (${msg})`,
+          error: `Unable to connect to Express backend server at ${backendUrl}. Ensure the server in 'server/' is running via 'npm start' on port 3001. (${msg})`,
         },
         { status: 502 }
       );

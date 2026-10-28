@@ -10,7 +10,7 @@ import {
 } from "react";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { Bot, User, Send, Database, Trophy, RefreshCw } from "lucide-react";
+import { Bot, User, Send, Database, Trophy, RefreshCw, Loader2 } from "lucide-react";
 import { StatTable, type TableData } from "@/components/stat-table";
 
 /* ────────────────────────────────────────── */
@@ -71,7 +71,13 @@ function formatToolName(tool: string): string {
 /*  Components                                */
 /* ────────────────────────────────────────── */
 
-function TypingIndicator({ activeTool }: { activeTool?: string | null }) {
+function TypingIndicator({
+  activeTool,
+  statusText,
+}: {
+  activeTool?: string | null;
+  statusText?: string | null;
+}) {
   return (
     <div className="flex items-start gap-3 animate-message-in">
       <div className="flex size-8 shrink-0 items-center justify-center rounded-full bg-primary/10 text-primary border border-primary/20">
@@ -82,6 +88,11 @@ function TypingIndicator({ activeTool }: { activeTool?: string | null }) {
           <div className="inline-flex items-center gap-2 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-1.5 text-xs text-emerald-700 animate-pulse-subtle">
             <Database className="size-3.5 animate-spin" />
             <span>Querying {formatToolName(activeTool)}...</span>
+          </div>
+        ) : statusText ? (
+          <div className="inline-flex items-center gap-2 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-1.5 text-xs text-emerald-700 animate-pulse-subtle">
+            <Loader2 className="size-3.5 animate-spin" />
+            <span>{statusText}</span>
           </div>
         ) : (
           <div className="flex items-center gap-1.5 rounded-2xl rounded-tl-sm bg-surface-2 px-4 py-3 dot-animation border border-border">
@@ -95,8 +106,23 @@ function TypingIndicator({ activeTool }: { activeTool?: string | null }) {
   );
 }
 
-function ChatMessage({ message }: { message: Message }) {
+function ChatMessage({
+  message,
+  isStreaming,
+}: {
+  message: Message;
+  isStreaming?: boolean;
+}) {
   const isUser = message.role === "user";
+
+  const hasContent = Boolean(message.content && message.content.trim());
+  const hasToolCalls = Boolean(message.toolCalls && message.toolCalls.length > 0);
+  const hasTables = Boolean(message.tables && message.tables.length > 0);
+
+  // Do not render empty assistant container while waiting for response
+  if (!isUser && !hasContent && !hasToolCalls && !hasTables) {
+    return null;
+  }
 
   return (
     <div
@@ -133,6 +159,9 @@ function ChatMessage({ message }: { message: Message }) {
                 {tc.args && typeof tc.args.query === "string" && (
                   <span className="text-zinc-600">&quot;{tc.args.query}&quot;</span>
                 )}
+                {tc.args && typeof tc.args.player === "string" && (
+                  <span className="text-zinc-600">&quot;{tc.args.player}&quot;</span>
+                )}
               </span>
             ))}
           </div>
@@ -143,12 +172,16 @@ function ChatMessage({ message }: { message: Message }) {
           <p className="whitespace-pre-wrap break-words">{message.content}</p>
         ) : (
           message.content && (
-            <div
-              className="prose-chat whitespace-pre-wrap break-words"
-              dangerouslySetInnerHTML={{
-                __html: renderMarkdown(message.content),
-              }}
-            />
+            <div className="prose-chat whitespace-pre-wrap break-words">
+              <span
+                dangerouslySetInnerHTML={{
+                  __html: renderMarkdown(message.content),
+                }}
+              />
+              {isStreaming && (
+                <span className="inline-block w-1.5 h-3.5 ml-1 bg-emerald-600 animate-pulse align-middle rounded-sm" />
+              )}
+            </div>
           )
         )}
 
@@ -187,6 +220,8 @@ export default function Home() {
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [activeTool, setActiveTool] = useState<string | null>(null);
+  const [statusText, setStatusText] = useState<string | null>(null);
+  const [activeAssistantId, setActiveAssistantId] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -204,7 +239,7 @@ export default function Home() {
 
   useEffect(() => {
     scrollToBottom();
-  }, [messages, isLoading, activeTool, scrollToBottom]);
+  }, [messages, isLoading, activeTool, statusText, scrollToBottom]);
 
   // Auto-resize textarea
   useEffect(() => {
@@ -229,10 +264,11 @@ export default function Home() {
       const updatedMessages = [...messages, userMessage];
       setMessages(updatedMessages);
       setInput("");
+      const assistantId = generateId();
+      setActiveAssistantId(assistantId);
       setIsLoading(true);
       setActiveTool(null);
-
-      const assistantId = generateId();
+      setStatusText(null);
 
       try {
         const res = await fetch("/api/chat", {
@@ -294,6 +330,7 @@ export default function Home() {
                 // Tool execution started
                 if (parsed.type === "tool_call") {
                   setActiveTool(parsed.tool);
+                  setStatusText(null);
                   toolCalls.push({ tool: parsed.tool, args: parsed.args });
                   setMessages((prev) =>
                     prev.map((m) =>
@@ -306,6 +343,8 @@ export default function Home() {
 
                 // Structured table event
                 if (parsed.type === "table" && parsed.table) {
+                  setActiveTool(null);
+                  setStatusText("Analyzing statistics...");
                   tables.push(parsed.table);
                   setMessages((prev) =>
                     prev.map((m) =>
@@ -316,11 +355,22 @@ export default function Home() {
                   );
                 }
 
+                // Status event from backend
+                if (parsed.type === "status") {
+                  setActiveTool(null);
+                  setStatusText(
+                    parsed.status === "interpreting"
+                      ? "Interpreting metrics..."
+                      : parsed.status
+                  );
+                }
+
                 // Streaming text event (new protocol or legacy text)
                 const textChunk =
                   parsed.type === "text" ? parsed.text : parsed.text;
                 if (textChunk) {
                   setActiveTool(null);
+                  setStatusText(null);
                   assistantContent += textChunk;
                   setMessages((prev) =>
                     prev.map((m) =>
@@ -352,6 +402,8 @@ export default function Home() {
       } finally {
         setIsLoading(false);
         setActiveTool(null);
+        setStatusText(null);
+        setActiveAssistantId(null);
         textareaRef.current?.focus();
       }
     },
@@ -378,6 +430,8 @@ export default function Home() {
   };
 
   const hasMessages = messages.length > 0;
+  const currentAssistantMsg = messages.find((m) => m.id === activeAssistantId);
+  const hasStreamingText = Boolean(currentAssistantMsg?.content?.trim());
 
   return (
     <div className="flex h-dvh flex-col bg-background">
@@ -412,9 +466,18 @@ export default function Home() {
         ) : (
           <div className="mx-auto flex max-w-2xl flex-col gap-4 px-4 py-6">
             {messages.map((msg) => (
-              <ChatMessage key={msg.id} message={msg} />
+              <ChatMessage
+                key={msg.id}
+                message={msg}
+                isStreaming={isLoading && msg.id === activeAssistantId}
+              />
             ))}
-            {isLoading && <TypingIndicator activeTool={activeTool} />}
+            {isLoading && !hasStreamingText && (
+              <TypingIndicator
+                activeTool={activeTool}
+                statusText={statusText}
+              />
+            )}
           </div>
         )}
       </ScrollArea>
@@ -425,16 +488,30 @@ export default function Home() {
           onSubmit={handleSubmit}
           className="mx-auto flex max-w-2xl items-end gap-2"
         >
-          <div className="relative flex flex-1 items-end rounded-xl border border-border bg-background px-3 py-2 transition-colors focus-within:border-primary/50 focus-within:ring-1 focus-within:ring-primary/25">
+          <div
+            className={`relative flex flex-1 items-end rounded-xl border transition-colors px-3 py-2 ${
+              isLoading
+                ? "border-border/60 bg-muted/40 cursor-not-allowed opacity-75"
+                : "border-border bg-background focus-within:border-primary/50 focus-within:ring-1 focus-within:ring-primary/25"
+            }`}
+          >
             <textarea
               ref={textareaRef}
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={handleKeyDown}
-              placeholder="Ask a question..."
+              placeholder={
+                isLoading
+                  ? "Match Analyst is answering..."
+                  : "Ask a question..."
+              }
               disabled={isLoading}
               rows={1}
-              className="max-h-[160px] flex-1 resize-none bg-transparent text-sm text-foreground outline-none placeholder:text-muted-foreground disabled:opacity-50"
+              className={`max-h-[160px] flex-1 resize-none bg-transparent text-sm text-foreground outline-none transition-opacity ${
+                isLoading
+                  ? "cursor-not-allowed placeholder:text-muted-foreground/70"
+                  : "placeholder:text-muted-foreground"
+              }`}
             />
           </div>
           <Button
@@ -443,7 +520,11 @@ export default function Home() {
             size="icon"
             className="size-10 shrink-0 rounded-xl bg-primary text-primary-foreground transition-all hover:bg-primary/90 disabled:opacity-30"
           >
-            <Send className="size-4" />
+            {isLoading ? (
+              <Loader2 className="size-4 animate-spin" />
+            ) : (
+              <Send className="size-4" />
+            )}
           </Button>
         </form>
       </footer>

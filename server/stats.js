@@ -198,6 +198,18 @@ function rowsFor(playerId) {
   );
 }
 
+function resolvePlayer(idOrName) {
+  if (!idOrName) return null;
+  const str = String(idOrName).trim();
+  // 1. Direct ID match
+  const direct = rowsFor(str);
+  if (direct.length > 0) return { playerId: str, player: direct[0].player };
+  // 2. Search by name
+  const matches = searchPlayers(str, 1);
+  if (matches.length > 0) return { playerId: matches[0].player_id, player: matches[0].player };
+  return null;
+}
+
 // A player who moved clubs mid-season can have 2 rows in a season; merge them.
 function mergeSeason(rows) {
   if (rows.length === 1) return rows[0];
@@ -238,9 +250,12 @@ function projection(row) {
   };
 }
 
-function playerReport(playerId, season, scope = "league") {
+function playerReport(playerIdOrName, season, scope = "league") {
+  const resolved = resolvePlayer(playerIdOrName);
+  if (!resolved) return { error: `No player found matching "${playerIdOrName}"` };
+  const playerId = resolved.playerId;
   const all = rowsFor(playerId);
-  if (!all.length) return { error: `No player with id ${playerId}` };
+  if (!all.length) return { error: `No player data found for ${resolved.player || playerId}` };
   const s = season || all[0].season;
   const row = seasonRow(playerId, s);
   if (!row) return { error: `No ${seasonLabel(s)} data for ${all[0].player}` };
@@ -383,6 +398,7 @@ load();
 
 module.exports = {
   searchPlayers,
+  resolvePlayer,
   playerReport,
   buildTable,
   leaders,
