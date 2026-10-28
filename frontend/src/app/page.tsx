@@ -62,6 +62,8 @@ function formatToolName(tool: string): string {
       return "Head-to-Head Comparison Engine";
     case "get_leaders":
       return "League Metric Leaderboard";
+    case "get_team_report":
+      return "Team Tactical Analysis";
     default:
       return tool;
   }

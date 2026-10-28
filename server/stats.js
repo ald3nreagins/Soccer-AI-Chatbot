@@ -5,6 +5,7 @@ const fs = require("fs");
 const path = require("path");
 
 const DATA_PATH = path.join(__dirname, "..", "data", "players.json");
+const BUNDLE_PATH = path.join(__dirname, "..", "data", "ai_context_bundle.json");
 const MIN_MINUTES = Number(process.env.MIN_MINUTES || 360);
 
 const LEAGUE_GAMES = {
@@ -31,7 +32,24 @@ const METRICS = {
 
 // ---------- load ----------
 let ROWS = [];
+let TEAMS = [];
+
+function loadTeams() {
+  if (fs.existsSync(BUNDLE_PATH)) {
+    try {
+      const bundle = JSON.parse(fs.readFileSync(BUNDLE_PATH, "utf8"));
+      TEAMS = (bundle.structured_stats || []).filter(
+        (r) => r.record_type === "team_season"
+      );
+      console.log(`Loaded ${TEAMS.length} team stats from ai_context_bundle.json`);
+    } catch (err) {
+      console.warn("Could not load ai_context_bundle.json:", err.message);
+    }
+  }
+}
+
 function load() {
+  loadTeams();
   if (!fs.existsSync(DATA_PATH)) {
     console.warn(`No data at ${DATA_PATH}. Run scripts/fetch_understat.py first.`);
     ROWS = [];
@@ -394,6 +412,63 @@ function toSeasonCode(s) {
   return currentSeason();
 }
 
+// ---------- team stats (from ai_context_bundle.json) ----------
+function teamReport(query) {
+  if (!query) return { error: "Please specify a team name." };
+  const q = norm(query);
+  const match = TEAMS.find(
+    (t) => norm(t.entity_name).includes(q) || q.includes(norm(t.entity_name))
+  );
+  if (!match) {
+    const available = TEAMS.map((t) => t.entity_name).join(", ");
+    return {
+      error: `No team found matching "${query}". Available Premier League clubs: ${available}`,
+    };
+  }
+
+  return {
+    team: match.entity_name,
+    league: match.league,
+    season: match.season,
+    matches: num(match.nineties_played),
+    minutes: num(match.minutes),
+    goals: num(match.goals),
+    xg: num(match.xG),
+    npxg: num(match.npxG),
+    g_minus_xg: num(match.G_minus_xG),
+    np_g_minus_xg: num(match.np_G_minus_xG),
+    shots: num(match.shots),
+    shots_per_90: num(match.shots_per_90),
+    shots_on_target: num(match.shots_on_target),
+    sot_pct: num(match.sot_pct),
+    avg_shot_dist_yds: num(match.avg_shot_dist_yds),
+    key_passes: num(match.key_passes),
+    progressive_passes: num(match.progressive_passes),
+    ai_finishing_diagnosis: match.ai_finishing_diagnosis,
+  };
+}
+
+function buildTeamTable(reports) {
+  const valid = reports.filter((r) => !r.error);
+  if (!valid.length) return null;
+  const columns = ["Metric", ...valid.map((r) => r.team)];
+  const rows = [
+    ["Season", ...valid.map((r) => r.season)],
+    ["Matches (90s)", ...valid.map((r) => r.matches)],
+    ["Goals", ...valid.map((r) => r.goals)],
+    ["xG", ...valid.map((r) => r.xg)],
+    ["npxG", ...valid.map((r) => r.npxg)],
+    ["Finishing Diff (G - xG)", ...valid.map((r) => r.g_minus_xg)],
+    ["Shots / 90", ...valid.map((r) => r.shots_per_90)],
+    ["Shot Accuracy (SoT%)", ...valid.map((r) => r.sot_pct + "%")],
+    ["Avg Shot Distance", ...valid.map((r) => r.avg_shot_dist_yds + " yds")],
+    ["Key Passes", ...valid.map((r) => r.key_passes)],
+    ["Progressive Passes", ...valid.map((r) => r.progressive_passes)],
+    ["Finishing Diagnosis", ...valid.map((r) => r.ai_finishing_diagnosis)],
+  ];
+  return { columns, rows };
+}
+
 load();
 
 module.exports = {
@@ -402,8 +477,11 @@ module.exports = {
   playerReport,
   buildTable,
   leaders,
+  teamReport,
+  buildTeamTable,
   toSeasonCode,
   seasons: () => seasons().map(seasonLabel),
   METRICS,
   rowCount: () => ROWS.length,
+  teamCount: () => TEAMS.length,
 };

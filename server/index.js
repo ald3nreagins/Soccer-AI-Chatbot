@@ -147,6 +147,24 @@ const TOOLS = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "get_team_report",
+      description:
+        "Retrieve aggregated team shooting metrics, expected goals (xG/npxG), finishing efficiency, shot distance, and tactical finishing diagnosis for Premier League clubs (e.g. 'Arsenal', 'Aston Villa', 'Brighton', 'Burnley', 'Chelsea').",
+      parameters: {
+        type: "object",
+        properties: {
+          team: {
+            type: "string",
+            description: "Club name, e.g. 'Arsenal', 'Chelsea', 'Brighton', 'Aston Villa'",
+          },
+        },
+        required: ["team"],
+      },
+    },
+  },
 ];
 
 /* ────────────────────────────────────────── */
@@ -193,6 +211,14 @@ function executeTool(name, args) {
         const limit = args.limit ? Number(args.limit) : 10;
         const result = stats.leaders({ metric, position, league, season, per_90, limit });
         return result;
+      }
+
+      case "get_team_report": {
+        const team = args.team || "";
+        const report = stats.teamReport(team);
+        if (report.error) return { error: report.error };
+        const table = stats.buildTeamTable([report]);
+        return { report, table };
       }
 
       default:
