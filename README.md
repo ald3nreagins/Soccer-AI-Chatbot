@@ -5,7 +5,7 @@
 [[https://img.shields.io/badge/Course-ENGCMP%200600-orange.svg]](https://canvas.pitt.edu)
 
 > **"Stats are everywhere. Insight isn't."**  
-> PitchSide AI is a domain-specific soccer analytics chatbot that translates dense match numbers and advanced expected metrics (`xG`, `xA`, `KP`, `G-xG`, `PPDA`) into plain-English tactical insights for casual watchers and hardcore fans alike.
+> Soccer AI is a domain-specific soccer analytics chatbot that translates dense match numbers and advanced expected metrics (`xG`, `xA`, `KP`, `G-xG`, `PPDA`) into plain-English tactical insights for casual watchers and hardcore fans alike.
 
 ---
 
