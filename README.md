@@ -1,4 +1,4 @@
-# Soccer Analytics & Match Insight Chatbot
+# Soccer Analytics Chatbot
 
 [[https://img.shields.io/badge/Project%20Status-Active-brightgreen.svg]](https://github.com/ald3nreagins/Soccer-AI-Chatbot)
 [[https://img.shields.io/badge/License-MIT-blue.svg]](License.md)
