@@ -1,13 +1,25 @@
 // server/index.js — Express server with Ollama agent orchestration & stats engine tools
+//
+// v2.2 changes (after Project 5 usability testing):
+//   - Sets Ollama's context window (OLLAMA_NUM_CTX). Without it, Ollama's small default
+//     window cut off the start of long conversations, including the system prompt.
+//   - Caps conversation history (MAX_HISTORY) and strips duplicate tables from tool results
+//   - Final loop turn disables tools, so the model always writes an answer after fetching data
+//   - New compare_teams tool for side-by-side team comparisons with a verdict
+//   - System prompt now includes exactly what data is loaded
+//   - Fixed tool-call IDs and argument formats for both Ollama and cloud providers
 require("dotenv").config();
 
 const express = require("express");
 const cors = require("cors");
 const stats = require("./stats");
-const { SYSTEM_PROMPT } = require("./prompt");
+const { buildSystemPrompt } = require("./prompt");
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+
+// Built once at startup from the data that actually loaded.
+const SYSTEM_PROMPT = buildSystemPrompt(stats.coverage());
 
 // LLM Provider Configuration: supports local Ollama OR Cloud API (Groq, OpenRouter, OpenAI)
 const LLM_API_KEY =
@@ -25,11 +37,21 @@ const OLLAMA_URL = process.env.OLLAMA_URL || "http://localhost:11434";
 const DEFAULT_MODEL =
   process.env.MODEL || (IS_CLOUD_LLM ? "llama-3.1-8b-instant" : "qwen3:8b");
 
+// Context window for local Ollama (tokens). qwen3:8b supports far more than Ollama's default.
+const OLLAMA_NUM_CTX = Number(process.env.OLLAMA_NUM_CTX || 16384);
+// How many recent user/assistant messages to send with each request.
+const MAX_HISTORY = Number(process.env.MAX_HISTORY || 12);
+// Max model calls per user message (tool calls + final answer).
+const MAX_TURNS = 5;
+
+const FALLBACK_TEXT =
+  "I pulled the numbers above but couldn't finish writing the analysis. Try asking again, or ask about one comparison at a time.";
+
 app.use(cors());
 app.use(express.json());
 
 /* ────────────────────────────────────────── */
-/*  Tool Definitions for Ollama               */
+/*  Tool Definitions                          */
 /* ────────────────────────────────────────── */
 
 const TOOLS = [
@@ -87,7 +109,7 @@ const TOOLS = [
     function: {
       name: "compare_players",
       description:
-        "Perform a head-to-head comparison of 2 or more players by their names or IDs. Generates comparative percentiles, per-90 stats, and tabular data.",
+        "Head-to-head comparison of 2 or more players by name or ID. Always pass EVERY player the user wants compared, including players from earlier in the conversation.",
       parameters: {
         type: "object",
         properties: {
@@ -166,7 +188,7 @@ const TOOLS = [
     function: {
       name: "get_team_report",
       description:
-        "Retrieve aggregated team shooting metrics, expected goals (xG/npxG), finishing efficiency, shot distance, and tactical finishing diagnosis for Premier League clubs (e.g. 'Arsenal', 'Aston Villa', 'Brighton', 'Burnley', 'Chelsea').",
+        "Retrieve ONE Premier League club's season shooting metrics, expected goals (xG/npxG), finishing efficiency, and finishing diagnosis. For two or more clubs, use compare_teams instead.",
       parameters: {
         type: "object",
         properties: {
@@ -176,6 +198,25 @@ const TOOLS = [
           },
         },
         required: ["team"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "compare_teams",
+      description:
+        "Compare 2 or more Premier League clubs side by side. Returns each club's stats, which club leads each stat (the Edge), and an overall attacking verdict. Use this whenever the user asks about more than one team, e.g. 'Who had the better attack, Brighton or Aston Villa?'",
+      parameters: {
+        type: "object",
+        properties: {
+          teams: {
+            type: "array",
+            items: { type: "string" },
+            description: "Array of club names, e.g. ['Brighton', 'Aston Villa']",
+          },
+        },
+        required: ["teams"],
       },
     },
   },
@@ -192,6 +233,7 @@ function executeTool(name, args) {
         const query = args.query || "";
         const limit = args.limit ? Number(args.limit) : 5;
         const results = stats.searchPlayers(query, limit);
+        if (!results.length) return { results, note: `No matches. ${stats.coverageText()}` };
         return { results };
       }
 
@@ -200,7 +242,7 @@ function executeTool(name, args) {
         const season = args.season ? stats.toSeasonCode(args.season) : undefined;
         const scope = args.scope || "league";
         const report = stats.playerReport(playerArg, season, scope);
-        if (report.error) return { error: report.error };
+        if (report.error) return report;
         const table = stats.buildTable([report]);
         return { report, table };
       }
@@ -217,22 +259,29 @@ function executeTool(name, args) {
       }
 
       case "get_leaders": {
-        const metric = args.metric;
-        const position = args.position;
-        const league = args.league;
-        const season = args.season;
         const per_90 = args.per_90 !== false;
         const limit = args.limit ? Number(args.limit) : 10;
-        const result = stats.leaders({ metric, position, league, season, per_90, limit });
-        return result;
+        return stats.leaders({
+          metric: args.metric,
+          position: args.position,
+          league: args.league,
+          season: args.season,
+          per_90,
+          limit,
+        });
       }
 
       case "get_team_report": {
-        const team = args.team || "";
-        const report = stats.teamReport(team);
-        if (report.error) return { error: report.error };
+        const report = stats.teamReport(args.team || "");
+        if (report.error) return report;
         const table = stats.buildTeamTable([report]);
         return { report, table };
+      }
+
+      case "compare_teams": {
+        const rawTeams = args.teams || args.team || [];
+        const teams = Array.isArray(rawTeams) ? rawTeams.map(String) : [String(rawTeams)];
+        return stats.compareTeams(teams);
       }
 
       default:
@@ -241,6 +290,34 @@ function executeTool(name, args) {
   } catch (err) {
     return { error: `Failed to execute ${name}: ${err.message}` };
   }
+}
+
+// The frontend already receives each table as its own event, so the model doesn't need
+// the table a second time. Player history is also dropped from multi-player comparisons.
+// Smaller tool results keep long conversations inside the context window.
+function compactForModel(name, result) {
+  const copy = { ...result };
+  delete copy.table;
+  if (name === "compare_players" && Array.isArray(copy.reports)) {
+    copy.reports = copy.reports.map((r) => {
+      if (r.error) return r;
+      const { history, ...rest } = r;
+      return rest;
+    });
+  }
+  return JSON.stringify(copy);
+}
+
+function parseArgs(raw) {
+  if (raw && typeof raw === "object") return raw;
+  if (typeof raw === "string" && raw.trim()) {
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return {};
+    }
+  }
+  return {};
 }
 
 /* ────────────────────────────────────────── */
@@ -359,7 +436,10 @@ app.get("/api/health", async (req, res) => {
     statsLoaded: stats.rowCount(),
     teamsLoaded: stats.teamCount(),
     seasons: stats.seasons(),
+    coverage: stats.coverage(),
     configuredModel: DEFAULT_MODEL,
+    contextWindow: IS_CLOUD_LLM ? "provider default" : OLLAMA_NUM_CTX,
+    maxHistory: MAX_HISTORY,
     llmConnected,
     availableModels,
   });
@@ -413,25 +493,43 @@ app.post("/api/chat", async (req, res) => {
   // Send an immediate SSE comment ping so client/proxy connects without waiting for model generation
   res.write(":\n\n");
 
+  let anyText = false;
   const sendEvent = (data) => {
+    if (data.type === "text" && data.text) anyText = true;
     res.write(`data: ${JSON.stringify(data)}\n\n`);
   };
 
   try {
-    // Build conversation history starting with SYSTEM_PROMPT
-    const conversation = [
-      { role: "system", content: SYSTEM_PROMPT },
-      ...messages.map((m) => ({
-        role: m.role,
-        content: m.content || "",
-      })),
-    ];
+    // Keep only recent user/assistant text messages, starting with a user message.
+    const history = messages
+      .filter(
+        (m) =>
+          (m.role === "user" || m.role === "assistant") &&
+          typeof m.content === "string" &&
+          m.content.trim()
+      )
+      .slice(-MAX_HISTORY)
+      .map((m) => ({ role: m.role, content: m.content }));
+    while (history.length && history[0].role !== "user") history.shift();
+
+    // The system prompt always comes first, so it is never the part that gets cut.
+    const conversation = [{ role: "system", content: SYSTEM_PROMPT }, ...history];
 
     let turns = 0;
-    const maxTurns = 5;
+    let lastTurnUsedTools = false;
 
-    while (turns < maxTurns) {
+    while (turns < MAX_TURNS) {
       turns++;
+      // On the final turn, tools are switched off so the model must write its answer.
+      const allowTools = turns < MAX_TURNS;
+
+      if (!allowTools && lastTurnUsedTools) {
+        conversation.push({
+          role: "user",
+          content:
+            "Using the tool results above, write your answer now in the required format (Headline, Breakdown, Stat check, Data). Do not call more tools.",
+        });
+      }
 
       let response;
       try {
@@ -447,6 +545,7 @@ app.post("/api/chat", async (req, res) => {
               model: activeModel,
               messages: conversation,
               tools: TOOLS,
+              tool_choice: allowTools ? "auto" : "none",
               stream: true,
             }),
           });
@@ -457,9 +556,10 @@ app.post("/api/chat", async (req, res) => {
             body: JSON.stringify({
               model: activeModel,
               messages: conversation,
-              tools: TOOLS,
+              ...(allowTools ? { tools: TOOLS } : {}),
               think: activeThink,
               stream: true,
+              options: { num_ctx: OLLAMA_NUM_CTX },
             }),
           });
         }
@@ -509,17 +609,13 @@ app.post("/api/chat", async (req, res) => {
                   const idx = tc.index ?? turnToolCalls.length;
                   if (!turnToolCalls[idx]) {
                     turnToolCalls[idx] = {
-                      id: tc.id || `call_${idx}`,
+                      id: tc.id || `call_${turns}_${idx}`,
                       type: "function",
                       function: { name: tc.function?.name || "", arguments: "" },
                     };
                   }
-                  if (tc.id) {
-                    turnToolCalls[idx].id = tc.id;
-                  }
-                  if (tc.function?.name) {
-                    turnToolCalls[idx].function.name = tc.function.name;
-                  }
+                  if (tc.id) turnToolCalls[idx].id = tc.id;
+                  if (tc.function?.name) turnToolCalls[idx].function.name = tc.function.name;
                   if (tc.function?.arguments) {
                     turnToolCalls[idx].function.arguments += tc.function.arguments;
                   }
@@ -560,91 +656,72 @@ app.post("/api/chat", async (req, res) => {
       const flushed = thinkFilter.flush();
       if (flushed) {
         turnContent += flushed;
-        sendEvent({
-          type: "text",
-          text: flushed,
-        });
+        sendEvent({ type: "text", text: flushed });
       }
 
+      const toolCalls = turnToolCalls.filter((tc) => tc && tc.function?.name);
+
       // If the model requested tool calls, execute them deterministically
-      if (turnToolCalls.length > 0) {
+      if (toolCalls.length > 0 && allowTools) {
+        lastTurnUsedTools = true;
+
+        // One ID per call, used in BOTH the assistant message and the tool result.
+        const calls = toolCalls.map((tc, idx) => ({
+          id: tc.id || `call_${turns}_${idx}`,
+          name: tc.function.name,
+          args: parseArgs(tc.function.arguments),
+        }));
+
+        // Cloud providers expect arguments as a JSON string; Ollama expects an object.
         conversation.push({
           role: "assistant",
-          content: turnContent || null,
-          tool_calls: turnToolCalls.map((tc, idx) => ({
-            id: tc.id || `call_${idx}`,
-            type: "function",
-            function: {
-              name: tc.function?.name,
-              arguments:
-                typeof tc.function?.arguments === "string"
-                  ? tc.function.arguments
-                  : JSON.stringify(tc.function?.arguments || {}),
-            },
-          })),
+          content: turnContent || (IS_CLOUD_LLM ? null : ""),
+          tool_calls: calls.map((c) =>
+            IS_CLOUD_LLM
+              ? { id: c.id, type: "function", function: { name: c.name, arguments: JSON.stringify(c.args) } }
+              : { function: { name: c.name, arguments: c.args } }
+          ),
         });
 
-        for (const tc of turnToolCalls) {
-          const fnName = tc.function?.name;
-          let fnArgs = tc.function?.arguments || {};
-          if (typeof fnArgs === "string") {
-            try {
-              fnArgs = JSON.parse(fnArgs);
-            } catch {
-              fnArgs = {};
-            }
-          }
-
+        for (const c of calls) {
           // Emit tool call event so frontend displays Trophy badge
-          sendEvent({
-            type: "tool_call",
-            tool: fnName,
-            args: fnArgs,
-          });
+          sendEvent({ type: "tool_call", tool: c.name, args: c.args });
 
           // Execute tool against stats engine
-          const toolResult = executeTool(fnName, fnArgs);
+          const toolResult = executeTool(c.name, c.args);
 
           // If tool output includes a structured stat table, emit table event
           if (toolResult.table) {
-            sendEvent({
-              type: "table",
-              table: toolResult.table,
-            });
+            sendEvent({ type: "table", table: toolResult.table });
           }
 
-          // Append tool execution response to conversation
-          conversation.push({
-            role: "tool",
-            tool_call_id: tc.id || `call_${fnName}`,
-            name: fnName,
-            content: JSON.stringify(toolResult),
-          });
+          // Append tool execution response to conversation (without the duplicate table)
+          conversation.push(
+            IS_CLOUD_LLM
+              ? { role: "tool", tool_call_id: c.id, name: c.name, content: compactForModel(c.name, toolResult) }
+              : { role: "tool", tool_name: c.name, content: compactForModel(c.name, toolResult) }
+          );
         }
 
         // Notify client that tool execution is complete and model will interpret
-        sendEvent({
-          type: "status",
-          status: "interpreting",
-        });
+        sendEvent({ type: "status", status: "interpreting" });
 
         // Continue loop to let the model interpret the tool outputs
         continue;
       }
 
+      lastTurnUsedTools = false;
+
       // Check if model emitted filler text promising action without invoking a tool
       const isFillerPromise =
-        turns < maxTurns &&
+        turns < MAX_TURNS &&
         turnContent.length < 250 &&
         /(one moment|let me (search|retrieve|look|find|check)|searching now|i'll check|i will search|hold on)/i.test(
           turnContent
         );
 
       if (isFillerPromise) {
-        conversation.push({
-          role: "assistant",
-          content: turnContent,
-        });
+        conversation.push({ role: "assistant", content: turnContent });
         conversation.push({
           role: "user",
           content: "Please execute the tool call directly now without conversational filler.",
@@ -653,6 +730,11 @@ app.post("/api/chat", async (req, res) => {
       }
 
       break;
+    }
+
+    // Never leave the user with only a table and no explanation.
+    if (!anyText) {
+      sendEvent({ type: "text", text: FALLBACK_TEXT });
     }
 
     res.write("data: [DONE]\n\n");
@@ -672,11 +754,11 @@ app.post("/api/chat", async (req, res) => {
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`\n======================================================`);
-  console.log(`  Soccer AI Match Analyst — Express Backend`);
+  console.log(`  PitchSide AI — Express Backend (v2.2)`);
   console.log(`  Listening on: http://localhost:${PORT} (0.0.0.0:${PORT})`);
   console.log(`  Mode: ${IS_CLOUD_LLM ? `Cloud (${process.env.GROQ_API_KEY ? "Groq" : "OpenAI-compatible"})` : "Local Ollama"}`);
   console.log(`  Model: ${DEFAULT_MODEL}`);
+  if (!IS_CLOUD_LLM) console.log(`  Context window: ${OLLAMA_NUM_CTX} tokens`);
   console.log(`  Dataset: ${stats.rowCount()} player rows, ${stats.teamCount()} teams loaded`);
   console.log(`======================================================\n`);
 });
-

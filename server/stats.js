@@ -1,5 +1,12 @@
 // stats.js — all number crunching happens here, NOT in the model.
 // The model only explains what these functions return.
+//
+// v2.2 changes (after Project 5 usability testing):
+//   - compareTeams(): side-by-side team comparison with an "Edge" column and an attacking verdict
+//   - teamReport(): returns more stats (xA, npxG per shot, goals per shot on target, total shots)
+//   - coverage(): describes exactly what data is loaded, so the bot can explain its limits
+//   - resolvePlayer(): refuses weak fuzzy matches instead of returning the wrong player
+//   - error messages now say what the dataset DOES cover
 
 const fs = require("fs");
 const path = require("path");
@@ -7,6 +14,8 @@ const path = require("path");
 const DATA_PATH = path.join(__dirname, "..", "data", "players.json");
 const BUNDLE_PATH = path.join(__dirname, "..", "data", "ai_context_bundle.json");
 const MIN_MINUTES = Number(process.env.MIN_MINUTES || 360);
+// A name match must score at least this high to count (100 = exact, 90 = contains, 80 = all tokens match).
+const MIN_MATCH_SCORE = Number(process.env.MIN_MATCH_SCORE || 75);
 
 const LEAGUE_GAMES = {
   "ENG-Premier League": 38,
@@ -104,10 +113,39 @@ function seasons() {
 }
 const currentSeason = () => seasons()[0];
 
-// "2627" -> "2026-27"
+// "2627" -> "2026-27". Also turns the FBref team code "2021" into "2020-21".
 function seasonLabel(s) {
-  if (!s || s.length !== 4) return s;
+  if (!s || String(s).length !== 4) return s;
+  s = String(s);
   return `20${s.slice(0, 2)}-${s.slice(2)}`;
+}
+
+// ---------- coverage (what the bot can and cannot answer) ----------
+function coverage() {
+  return {
+    team_season: TEAMS.length ? seasonLabel(TEAMS[0].season) : null,
+    teams: TEAMS.map((t) => t.entity_name),
+    player_leagues: [...new Set(ROWS.map((r) => r.league))],
+    player_seasons: seasons().map(seasonLabel),
+    players_loaded: ROWS.length,
+    min_minutes: MIN_MINUTES,
+  };
+}
+
+function coverageText() {
+  const c = coverage();
+  const parts = [];
+  parts.push(
+    c.teams.length
+      ? `Team stats cover ${c.teams.length} Premier League clubs (${c.teams.join(", ")}) for the ${c.team_season} season.`
+      : "No team stats are loaded."
+  );
+  parts.push(
+    c.players_loaded
+      ? `Player stats cover ${c.player_leagues.join(", ")} for ${c.player_seasons.join(", ")}.`
+      : "No player stats are loaded."
+  );
+  return parts.join(" ");
 }
 
 // ---------- search ----------
@@ -216,16 +254,23 @@ function rowsFor(playerId) {
   );
 }
 
+// Returns { playerId, player } or { error, suggestions }.
+// Weak fuzzy matches are rejected so the bot never reports stats for the wrong player.
 function resolvePlayer(idOrName) {
-  if (!idOrName) return null;
+  if (!idOrName) return { error: "No player name given." };
   const str = String(idOrName).trim();
   // 1. Direct ID match
   const direct = rowsFor(str);
   if (direct.length > 0) return { playerId: str, player: direct[0].player };
   // 2. Search by name
-  const matches = searchPlayers(str, 1);
-  if (matches.length > 0) return { playerId: matches[0].player_id, player: matches[0].player };
-  return null;
+  const matches = searchPlayers(str, 3);
+  if (matches.length > 0 && matches[0].match_quality >= MIN_MATCH_SCORE) {
+    return { playerId: matches[0].player_id, player: matches[0].player };
+  }
+  return {
+    error: `No player in the dataset matches "${str}". ${coverageText()}`,
+    suggestions: matches.map((m) => `${m.player} (${m.team})`),
+  };
 }
 
 // A player who moved clubs mid-season can have 2 rows in a season; merge them.
@@ -270,13 +315,16 @@ function projection(row) {
 
 function playerReport(playerIdOrName, season, scope = "league") {
   const resolved = resolvePlayer(playerIdOrName);
-  if (!resolved) return { error: `No player found matching "${playerIdOrName}"` };
+  if (resolved.error) return resolved;
   const playerId = resolved.playerId;
   const all = rowsFor(playerId);
-  if (!all.length) return { error: `No player data found for ${resolved.player || playerId}` };
+  if (!all.length) return { error: `No player data found for ${resolved.player || playerId}. ${coverageText()}` };
   const s = season || all[0].season;
   const row = seasonRow(playerId, s);
-  if (!row) return { error: `No ${seasonLabel(s)} data for ${all[0].player}` };
+  if (!row) {
+    const available = [...new Set(all.map((r) => seasonLabel(r.season)))].join(", ");
+    return { error: `No ${seasonLabel(s)} data for ${all[0].player}. Seasons available for this player: ${available}.` };
+  }
 
   const p90 = per90(row);
   const pct = percentiles(row, scope);
@@ -383,10 +431,12 @@ function ordinal(n) {
 // ---------- leaders ----------
 function leaders({ metric = "np_xg", position, league, season, per_90 = true, limit = 10 }) {
   if (!METRICS[metric]) return { error: `Unknown metric. Use one of: ${Object.keys(METRICS).join(", ")}` };
+  if (!ROWS.length) return { error: `Player stats are not loaded right now. ${coverageText()}` };
   const s = season ? toSeasonCode(season) : currentSeason();
   let rows = ROWS.filter((r) => r.season === s && r.minutes >= MIN_MINUTES);
   if (position) rows = rows.filter((r) => r.group === position.toUpperCase());
   if (league) rows = rows.filter((r) => r.league.toLowerCase().includes(league.toLowerCase()));
+  if (!rows.length) return { error: `No players match those filters. ${coverageText()}` };
   const scored = rows
     .map((r) => ({ r, v: per_90 ? per90(r)[metric] : r[metric] }))
     .sort((a, b) => b.v - a.v)
@@ -413,59 +463,139 @@ function toSeasonCode(s) {
 }
 
 // ---------- team stats (from ai_context_bundle.json) ----------
+function findTeam(query) {
+  const q = norm(query);
+  if (!q) return null;
+  return TEAMS.find((t) => norm(t.entity_name).includes(q) || q.includes(norm(t.entity_name))) || null;
+}
+
 function teamReport(query) {
   if (!query) return { error: "Please specify a team name." };
-  const q = norm(query);
-  const match = TEAMS.find(
-    (t) => norm(t.entity_name).includes(q) || q.includes(norm(t.entity_name))
-  );
+  const match = findTeam(query);
   if (!match) {
-    const available = TEAMS.map((t) => t.entity_name).join(", ");
-    return {
-      error: `No team found matching "${query}". Available Premier League clubs: ${available}`,
-    };
+    return { error: `No team in the dataset matches "${query}". ${coverageText()}` };
   }
 
   return {
     team: match.entity_name,
     league: match.league,
-    season: match.season,
+    season: seasonLabel(match.season),
     matches: num(match.nineties_played),
     minutes: num(match.minutes),
     goals: num(match.goals),
+    assists: num(match.assists),
     xg: num(match.xG),
     npxg: num(match.npxG),
+    xa: num(match.xA),
     g_minus_xg: num(match.G_minus_xG),
     np_g_minus_xg: num(match.np_G_minus_xG),
     shots: num(match.shots),
     shots_per_90: num(match.shots_per_90),
     shots_on_target: num(match.shots_on_target),
     sot_pct: num(match.sot_pct),
+    npxg_per_shot: num(match.npxG_per_shot),
+    goals_per_shot: num(match.goals_per_shot),
+    goals_per_sot: num(match.goals_per_sot),
     avg_shot_dist_yds: num(match.avg_shot_dist_yds),
+    penalties_made: num(match.penalties_made),
+    penalties_att: num(match.penalties_att),
     key_passes: num(match.key_passes),
     progressive_passes: num(match.progressive_passes),
     ai_finishing_diagnosis: match.ai_finishing_diagnosis,
   };
 }
 
-function buildTeamTable(reports) {
+// [key, label, direction (1 = higher is better, -1 = lower is better), unit]
+const TEAM_METRICS = [
+  ["goals", "Goals", 1, ""],
+  ["xg", "xG", 1, ""],
+  ["npxg", "npxG", 1, ""],
+  ["g_minus_xg", "Finishing Diff (G - xG)", 1, ""],
+  ["shots_per_90", "Shots / 90", 1, ""],
+  ["sot_pct", "Shot Accuracy (SoT%)", 1, "%"],
+  ["npxg_per_shot", "npxG per Shot", 1, ""],
+  ["goals_per_sot", "Goals per Shot on Target", 1, ""],
+  ["avg_shot_dist_yds", "Avg Shot Distance", -1, " yds"],
+  ["xa", "xA", 1, ""],
+  ["key_passes", "Key Passes", 1, ""],
+  ["progressive_passes", "Progressive Passes", 1, ""],
+];
+
+// The stats that decide "who had the better attack".
+const ATTACK_CORE = ["goals", "xg", "npxg", "shots_per_90", "sot_pct", "npxg_per_shot"];
+
+function computeEdges(reports) {
+  return TEAM_METRICS.map(([key, label, dir, unit]) => {
+    const vals = reports.map((r) => ({ team: r.team, v: r[key] }));
+    const sorted = [...vals].sort((a, b) => dir * (b.v - a.v));
+    const margin = round(Math.abs(sorted[0].v - sorted[1].v), 2);
+    const leader = margin === 0 ? "Even" : sorted[0].team;
+    // Human-readable margin: "+13", "+7.5 pts", "0.1 yds closer"
+    let gap = `+${margin}`;
+    if (unit === "%") gap = `+${margin} pts`;
+    if (dir === -1) gap = `${margin}${unit} closer`;
+    const display = leader === "Even" ? "Even" : `${leader} (${gap})`;
+    return { key, label, leader, margin, unit, gap, display };
+  });
+}
+
+function computeVerdict(reports, edges) {
+  const wins = Object.fromEntries(reports.map((r) => [r.team, 0]));
+  const core = edges.filter((e) => ATTACK_CORE.includes(e.key));
+  for (const e of core) if (e.leader !== "Even") wins[e.leader]++;
+  const ranked = Object.entries(wins).sort((a, b) => b[1] - a[1]);
+  const [topTeam, topWins] = ranked[0];
+  const secondWins = ranked[1][1];
+  const leader = topWins === secondWins ? "Too close to call" : topTeam;
+  return {
+    question_answered: "Which team had the better attack?",
+    leader,
+    core_stats_won: wins,
+    core_stats_compared: core.map((e) => e.label),
+    close_call: topWins - secondWins <= 1,
+    deciding_stats: core
+      .filter((e) => e.leader === topTeam)
+      .map((e) => `${e.label} (${e.gap})`),
+  };
+}
+
+function compareTeams(teamNames) {
+  const names = Array.isArray(teamNames) ? teamNames : [teamNames];
+  const reports = names.map((t) => teamReport(String(t)));
+  const valid = reports.filter((r) => !r.error);
+  const errors = reports.filter((r) => r.error).map((r) => r.error);
+  if (valid.length < 2) {
+    return {
+      error: `Need at least two teams from the dataset to compare. ${errors.join(" ")} ${errors.length ? "" : coverageText()}`.trim(),
+      reports,
+    };
+  }
+  const edges = computeEdges(valid);
+  const verdict = computeVerdict(valid, edges);
+  return { reports: valid, errors, edges, verdict, table: buildTeamTable(valid, edges) };
+}
+
+function fmt(v, unit) {
+  return unit ? `${v}${unit}` : v;
+}
+
+function buildTeamTable(reports, edges = null) {
   const valid = reports.filter((r) => !r.error);
   if (!valid.length) return null;
-  const columns = ["Metric", ...valid.map((r) => r.team)];
+  const showEdge = edges && valid.length >= 2;
+  const columns = ["Metric", ...valid.map((r) => r.team), ...(showEdge ? ["Edge"] : [])];
   const rows = [
-    ["Season", ...valid.map((r) => r.season)],
-    ["Matches (90s)", ...valid.map((r) => r.matches)],
-    ["Goals", ...valid.map((r) => r.goals)],
-    ["xG", ...valid.map((r) => r.xg)],
-    ["npxG", ...valid.map((r) => r.npxg)],
-    ["Finishing Diff (G - xG)", ...valid.map((r) => r.g_minus_xg)],
-    ["Shots / 90", ...valid.map((r) => r.shots_per_90)],
-    ["Shot Accuracy (SoT%)", ...valid.map((r) => r.sot_pct + "%")],
-    ["Avg Shot Distance", ...valid.map((r) => r.avg_shot_dist_yds + " yds")],
-    ["Key Passes", ...valid.map((r) => r.key_passes)],
-    ["Progressive Passes", ...valid.map((r) => r.progressive_passes)],
-    ["Finishing Diagnosis", ...valid.map((r) => r.ai_finishing_diagnosis)],
+    ["Season", ...valid.map((r) => r.season), ...(showEdge ? [""] : [])],
+    ["Matches (90s)", ...valid.map((r) => r.matches), ...(showEdge ? [""] : [])],
   ];
+  TEAM_METRICS.forEach(([key, label, , unit], i) => {
+    const row = [label, ...valid.map((r) => fmt(r[key], unit))];
+    if (showEdge) {
+      row.push(edges[i].display);
+    }
+    rows.push(row);
+  });
+  rows.push(["Finishing Diagnosis", ...valid.map((r) => r.ai_finishing_diagnosis), ...(showEdge ? [""] : [])]);
   return { columns, rows };
 }
 
@@ -478,8 +608,11 @@ module.exports = {
   buildTable,
   leaders,
   teamReport,
+  compareTeams,
   buildTeamTable,
   toSeasonCode,
+  coverage,
+  coverageText,
   seasons: () => seasons().map(seasonLabel),
   METRICS,
   rowCount: () => ROWS.length,
