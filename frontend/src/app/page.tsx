@@ -1,5 +1,13 @@
 "use client";
 
+// v2.2 changes (after Project 5 usability testing):
+//   - Welcome screen: starter questions + what data the bot covers (Ctrl+F "STARTER_QUESTIONS")
+//   - Stream reader buffers partial lines, so text split across network chunks is no longer dropped
+//   - Backend error events now show in the chat instead of failing silently
+//   - Tool badges for compare_teams and for multi-team / multi-player comparisons
+//   - Markdown renderer escapes HTML first (safer) and renders "- " lines as bullets
+//   - Renamed "Soccer AI" / "Match Analyst" to PitchSide AI
+
 import {
   useState,
   useRef,
@@ -31,6 +39,21 @@ interface Message {
 }
 
 /* ────────────────────────────────────────── */
+/*  Starter questions & data coverage         */
+/* ────────────────────────────────────────── */
+
+// Each one shows off a different feature. Clicking a button sends the question.
+const STARTER_QUESTIONS = [
+  "What does xG mean?",
+  "Did Brighton or Aston Villa have the better attack?",
+  "Compare Saka and Palmer this season",
+  "Who leads the Premier League in xA?",
+];
+
+const DATA_COVERAGE_TEXT =
+  "Player stats from Europe's top five leagues (2024–25 to 2026–27) and team stats for five Premier League clubs (2020–21).";
+
+/* ────────────────────────────────────────── */
 /*  Helpers                                   */
 /* ────────────────────────────────────────── */
 
@@ -38,17 +61,25 @@ function generateId() {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
 }
 
-/** Lightweight markdown → HTML renderer */
-function renderMarkdown(text: string): string {
+function escapeHtml(text: string): string {
   return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+/** Lightweight markdown → HTML renderer (escapes HTML first) */
+function renderMarkdown(text: string): string {
+  return escapeHtml(text)
     .replace(/```(\w*)\n([\s\S]*?)```/g, "<pre><code>$2</code></pre>")
     .replace(/`([^`]+)`/g, "<code>$1</code>")
     .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
-    .replace(/\*(.+?)\*/g, "<em>$1</em>")
+    .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>")
     .replace(
-      /\[([^\]]+)\]\(([^)]+)\)/g,
+      /\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g,
       '<a href="$2" target="_blank" rel="noopener">$1</a>'
     )
+    .replace(/^- (.*)$/gm, "• $1")
     .replace(/\n/g, "<br/>");
 }
 
@@ -64,9 +95,25 @@ function formatToolName(tool: string): string {
       return "League Metric Leaderboard";
     case "get_team_report":
       return "Team Tactical Analysis";
+    case "compare_teams":
+      return "Team Comparison Engine";
     default:
       return tool;
   }
+}
+
+/** Short label of what a tool was asked about, e.g. "Brighton vs Aston Villa" */
+function toolArgLabel(args?: Record<string, unknown>): string | null {
+  if (!args) return null;
+  for (const key of ["teams", "players"]) {
+    const v = args[key];
+    if (Array.isArray(v) && v.length) return v.map(String).join(" vs ");
+  }
+  for (const key of ["query", "player", "team", "metric"]) {
+    const v = args[key];
+    if (typeof v === "string" && v) return v;
+  }
+  return null;
 }
 
 /* ────────────────────────────────────────── */
@@ -151,21 +198,19 @@ function ChatMessage({
         {/* Render executed tool badges */}
         {!isUser && message.toolCalls && message.toolCalls.length > 0 && (
           <div className="mb-2.5 flex flex-wrap gap-1.5 border-b border-border pb-2">
-            {message.toolCalls.map((tc, idx) => (
-              <span
-                key={idx}
-                className="inline-flex items-center gap-1.5 rounded-md border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[11px] font-medium text-emerald-700"
-              >
-                <Trophy className="size-3" />
-                {formatToolName(tc.tool)}
-                {tc.args && typeof tc.args.query === "string" && (
-                  <span className="text-zinc-600">&quot;{tc.args.query}&quot;</span>
-                )}
-                {tc.args && typeof tc.args.player === "string" && (
-                  <span className="text-zinc-600">&quot;{tc.args.player}&quot;</span>
-                )}
-              </span>
-            ))}
+            {message.toolCalls.map((tc, idx) => {
+              const label = toolArgLabel(tc.args);
+              return (
+                <span
+                  key={idx}
+                  className="inline-flex items-center gap-1.5 rounded-md border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[11px] font-medium text-emerald-700"
+                >
+                  <Trophy className="size-3" />
+                  {formatToolName(tc.tool)}
+                  {label && <span className="text-zinc-600">&quot;{label}&quot;</span>}
+                </span>
+              );
+            })}
           </div>
         )}
 
@@ -174,7 +219,7 @@ function ChatMessage({
           <p className="whitespace-pre-wrap break-words">{message.content}</p>
         ) : (
           message.content && (
-            <div className="prose-chat whitespace-pre-wrap break-words">
+            <div className="prose-chat break-words">
               <span
                 dangerouslySetInnerHTML={{
                   __html: renderMarkdown(message.content),
@@ -200,15 +245,47 @@ function ChatMessage({
   );
 }
 
-function WelcomeScreen() {
+function WelcomeScreen({
+  onAsk,
+  disabled,
+}: {
+  onAsk: (question: string) => void;
+  disabled: boolean;
+}) {
   return (
-    <div className="flex flex-1 flex-col items-center justify-center gap-3 px-4 py-8 text-center max-w-md mx-auto">
+    <div className="flex flex-1 flex-col items-center justify-center gap-4 px-4 py-10 text-center max-w-xl mx-auto">
       <div className="flex size-12 items-center justify-center rounded-2xl bg-primary/10 text-primary border border-primary/20">
         <Trophy className="size-6" />
       </div>
-      <h2 className="text-lg font-semibold tracking-tight text-foreground">
-        Soccer AI
-      </h2>
+      <div className="space-y-1.5">
+        <h2 className="text-lg font-semibold tracking-tight text-foreground">
+          PitchSide AI
+        </h2>
+        <p className="text-sm text-muted-foreground">
+          Ask about any stat, player, or team in plain English. Try one of these to start:
+        </p>
+      </div>
+
+      <div className="grid w-full gap-2 sm:grid-cols-2">
+        {STARTER_QUESTIONS.map((q) => (
+          <button
+            key={q}
+            type="button"
+            onClick={() => onAsk(q)}
+            disabled={disabled}
+            className="rounded-xl border border-border bg-surface-2 px-3 py-2.5 text-left text-sm text-foreground transition-colors hover:border-primary/50 hover:bg-primary/5 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {q}
+          </button>
+        ))}
+      </div>
+
+      <p className="flex items-start gap-1.5 text-xs text-muted-foreground">
+        <Database className="mt-0.5 size-3.5 shrink-0" />
+        <span>
+          <span className="font-medium">Data:</span> {DATA_COVERAGE_TEXT}
+        </span>
+      </p>
     </div>
   );
 }
@@ -272,6 +349,22 @@ export default function Home() {
       setActiveTool(null);
       setStatusText(null);
 
+      // Adds the assistant message, or updates it if it already exists.
+      const upsertAssistant = (patch: Partial<Message>) => {
+        setMessages((prev) => {
+          const exists = prev.some((m) => m.id === assistantId);
+          if (exists) {
+            return prev.map((m) => (m.id === assistantId ? { ...m, ...patch } : m));
+          }
+          return [
+            ...prev,
+            { id: assistantId, role: "assistant", content: "", toolCalls: [], tables: [], ...patch },
+          ];
+        });
+      };
+
+      let assistantContent = "";
+
       try {
         const res = await fetch("/api/chat", {
           method: "POST",
@@ -285,122 +378,102 @@ export default function Home() {
         });
 
         if (!res.ok) {
-          const errorData = await res.json();
-          throw new Error(errorData.error || `HTTP ${res.status}`);
+          let message = `HTTP ${res.status}`;
+          try {
+            const errorData = await res.json();
+            message = errorData.error || message;
+          } catch {
+            // response was not JSON
+          }
+          throw new Error(message);
         }
 
         const reader = res.body?.getReader();
         const decoder = new TextDecoder();
 
-        let assistantContent = "";
         const toolCalls: ToolCallRecord[] = [];
         const tables: TableData[] = [];
+        let backendError: string | null = null;
+        let buffer = "";
 
         if (reader) {
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: assistantId,
-              role: "assistant",
-              content: "",
-              toolCalls: [],
-              tables: [],
-            },
-          ]);
+          upsertAssistant({});
 
-          while (true) {
+          let finished = false;
+          while (!finished) {
             const { done, value } = await reader.read();
             if (done) break;
 
-            const chunk = decoder.decode(value, { stream: true });
-            const lines = chunk
-              .split("\n")
-              .filter((line) => line.startsWith("data: "));
+            // Keep any partial line in the buffer until the rest arrives.
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split("\n");
+            buffer = lines.pop() ?? "";
 
             for (const line of lines) {
+              if (!line.startsWith("data: ")) continue;
               const dataStr = line.slice(6).trim();
-              if (dataStr === "[DONE]") break;
+              if (dataStr === "[DONE]") {
+                finished = true;
+                break;
+              }
 
+              let parsed;
               try {
-                const parsed = JSON.parse(dataStr);
+                parsed = JSON.parse(dataStr);
+              } catch {
+                console.warn("Skipped malformed chunk");
+                continue;
+              }
 
-                // Error event
-                if (parsed.error) {
-                  throw new Error(parsed.error);
-                }
+              // Error event from backend
+              if (parsed.error) {
+                backendError = String(parsed.error);
+                continue;
+              }
 
-                // Tool execution started
-                if (parsed.type === "tool_call") {
-                  setActiveTool(parsed.tool);
-                  setStatusText(null);
-                  toolCalls.push({ tool: parsed.tool, args: parsed.args });
-                  setMessages((prev) =>
-                    prev.map((m) =>
-                      m.id === assistantId
-                        ? { ...m, toolCalls: [...toolCalls] }
-                        : m
-                    )
-                  );
-                }
+              // Tool execution started
+              if (parsed.type === "tool_call") {
+                setActiveTool(parsed.tool);
+                setStatusText(null);
+                toolCalls.push({ tool: parsed.tool, args: parsed.args });
+                upsertAssistant({ toolCalls: [...toolCalls] });
+              }
 
-                // Structured table event
-                if (parsed.type === "table" && parsed.table) {
-                  setActiveTool(null);
-                  setStatusText("Analyzing statistics...");
-                  tables.push(parsed.table);
-                  setMessages((prev) =>
-                    prev.map((m) =>
-                      m.id === assistantId
-                        ? { ...m, tables: [...tables] }
-                        : m
-                    )
-                  );
-                }
+              // Structured table event
+              if (parsed.type === "table" && parsed.table) {
+                setActiveTool(null);
+                setStatusText("Analyzing statistics...");
+                tables.push(parsed.table);
+                upsertAssistant({ tables: [...tables] });
+              }
 
-                // Status event from backend
-                if (parsed.type === "status") {
-                  setActiveTool(null);
-                  setStatusText(
-                    parsed.status === "interpreting"
-                      ? "Interpreting metrics..."
-                      : parsed.status
-                  );
-                }
+              // Status event from backend
+              if (parsed.type === "status") {
+                setActiveTool(null);
+                setStatusText(
+                  parsed.status === "interpreting"
+                    ? "Interpreting metrics..."
+                    : parsed.status
+                );
+              }
 
-                // Streaming text event (new protocol or legacy text)
-                const textChunk =
-                  parsed.type === "text" ? parsed.text : parsed.text;
-                if (textChunk) {
-                  setActiveTool(null);
-                  setStatusText(null);
-                  assistantContent += textChunk;
-                  setMessages((prev) =>
-                    prev.map((m) =>
-                      m.id === assistantId
-                        ? { ...m, content: assistantContent }
-                        : m
-                    )
-                  );
-                }
-              } catch (parseErr) {
-                if (parseErr instanceof Error && parseErr.message !== "Unexpected end of JSON input") {
-                  console.warn("Chunk error:", parseErr.message);
-                }
+              // Streaming text event
+              if (parsed.type === "text" && parsed.text) {
+                setActiveTool(null);
+                setStatusText(null);
+                assistantContent += parsed.text;
+                upsertAssistant({ content: assistantContent });
               }
             }
           }
         }
+
+        if (backendError) throw new Error(backendError);
       } catch (err) {
         const errorText =
           err instanceof Error ? err.message : "Something went wrong";
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: assistantId,
-            role: "assistant",
-            content: `**Error:** ${errorText}`,
-          },
-        ]);
+        const prefix = assistantContent ? `${assistantContent}\n\n` : "";
+        upsertAssistant({ content: `${prefix}**Error:** ${errorText}` });
       } finally {
         setIsLoading(false);
         setActiveTool(null);
@@ -444,7 +517,7 @@ export default function Home() {
             <Trophy className="size-4" />
           </div>
           <h1 className="text-sm font-semibold text-foreground">
-            Soccer AI
+            PitchSide AI
           </h1>
         </div>
 
@@ -464,7 +537,7 @@ export default function Home() {
       {/* ── Chat Area ── */}
       <ScrollArea ref={scrollRef} className="flex-1">
         {!hasMessages ? (
-          <WelcomeScreen />
+          <WelcomeScreen onAsk={sendMessage} disabled={isLoading} />
         ) : (
           <div className="mx-auto flex max-w-2xl flex-col gap-4 px-4 py-6">
             {messages.map((msg) => (
@@ -504,8 +577,8 @@ export default function Home() {
               onKeyDown={handleKeyDown}
               placeholder={
                 isLoading
-                  ? "Match Analyst is answering..."
-                  : "Ask a question..."
+                  ? "PitchSide AI is answering..."
+                  : "Ask about a stat, player, or team..."
               }
               disabled={isLoading}
               rows={1}
